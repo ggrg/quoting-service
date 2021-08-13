@@ -34,7 +34,6 @@
  ******/
 
 const axios = require('axios')
-const crypto = require('crypto')
 const util = require('util')
 
 const ENUM = require('@mojaloop/central-services-shared').Enum
@@ -43,57 +42,17 @@ const EventSdk = require('@mojaloop/event-sdk')
 const LibUtil = require('@mojaloop/central-services-shared').Util
 const Logger = require('@mojaloop/central-services-logger')
 const MLNumber = require('@mojaloop/ml-number')
+const JwsSigner = require('@mojaloop/sdk-standard-components').Jws.signer
 
 const Config = require('../lib/config')
+const { httpRequest } = require('../lib/http')
+const { getStackOrInspect, generateRequestHeadersForJWS, generateRequestHeaders, calculateRequestHash } = require('../lib/util')
 const LOCAL_ENUM = require('../lib/enum')
 const rules = require('../../config/rules.json')
 const RulesEngine = require('./rules.js')
 
 delete axios.defaults.headers.common.Accept
 delete axios.defaults.headers.common['Content-Type']
-
-// TODO: where httpRequest is called, there's a pretty common pattern of obtaining an endpoint from
-// the database, specialising a template string with that endpoint, then calling httpRequest. Is
-// there common functionality in these places than can reasonably be factored out?
-/**
- * Encapsulates making an HTTP request and translating any error response into a domain-specific
- * error type.
- *
- * @param {Object} opts
- * @param {String} fspiopSource
- * @returns {Promise<void>}
- */
-const httpRequest = async (opts, fspiopSource) => {
-  // Network errors lob an exception. Bear in mind 3xx 4xx and 5xx are not network errors so we
-  // need to wrap the request below in a `try catch` to handle network errors
-  let res
-  let body
-
-  try {
-    res = await axios.request(opts)
-    body = await res.data
-  } catch (e) {
-    throw ErrorHandler.CreateFSPIOPError(ErrorHandler.Enums.FSPIOPErrorCodes.DESTINATION_COMMUNICATION_ERROR,
-      'Network error',
-      `${e.stack || util.inspect(e)}. Opts: ${util.inspect(opts)}`,
-      fspiopSource)
-  }
-
-  // handle non network related errors below
-  if (res.status < 200 || res.status >= 300) {
-    const errObj = util.inspect({
-      opts,
-      status: res.status,
-      statusText: res.statusText,
-      body
-    })
-
-    throw ErrorHandler.CreateFSPIOPError(ErrorHandler.Enums.FSPIOPErrorCodes.DESTINATION_COMMUNICATION_ERROR,
-      'Non-success response in HTTP request',
-      `${errObj}`,
-      fspiopSource)
-  }
-}
 
 /**
  * Encapsulates operations on the quotes domain model
@@ -162,7 +121,7 @@ class QuotesModel {
       const { FSPIOPError: code, message } = invalidQuoteRequestEvents[0].params
       // Will throw an internal server error if property doesn't exist
       throw ErrorHandler.CreateFSPIOPError(ErrorHandler.Enums.FSPIOPErrorCodes[code],
-        `Quote request ${quoteRequest.quoteId} failed: ${message}`, null, headers['fspiop-source'])
+        message, null, headers['fspiop-source'])
     }
 
     const interceptQuoteEvents = events.filter(ev => ev.type === INTERCEPT_QUOTE)
@@ -189,6 +148,7 @@ class QuotesModel {
    * @returns {promise} - promise will reject if request is not valid
    */
   async validateQuoteRequest (fspiopSource, fspiopDestination, quoteRequest) {
+    const envConfig = new Config()
     // note that the framework should validate the form of the request
     // here we can do some hard-coded rule validations to ensure requests
     // do not lead to unsupported scenarios or use-cases.
@@ -203,8 +163,15 @@ class QuotesModel {
       // internal-error
       throw ErrorHandler.CreateInternalServerFSPIOPError('Missing quoteRequest', null, fspiopSource)
     }
-    await this.db.getParticipant(fspiopSource, LOCAL_ENUM.PAYER_DFSP)
-    await this.db.getParticipant(fspiopDestination, LOCAL_ENUM.PAYEE_DFSP)
+
+    await this.db.getParticipant(fspiopSource, LOCAL_ENUM.PAYER_DFSP, quoteRequest.amount.currency, ENUM.Accounts.LedgerAccountType.POSITION)
+    await this.db.getParticipant(fspiopDestination, LOCAL_ENUM.PAYEE_DFSP, quoteRequest.amount.currency, ENUM.Accounts.LedgerAccountType.POSITION)
+
+    // Following is the validation to make sure valid fsp's are used in the payload for simple routing mode
+    if (envConfig.simpleRoutingMode) {
+      await this.db.getParticipant(quoteRequest.payer.partyIdInfo.fspId, LOCAL_ENUM.PAYER_DFSP, quoteRequest.amount.currency, ENUM.Accounts.LedgerAccountType.POSITION)
+      await this.db.getParticipant(quoteRequest.payee.partyIdInfo.fspId, LOCAL_ENUM.PAYEE_DFSP, quoteRequest.amount.currency, ENUM.Accounts.LedgerAccountType.POSITION)
+    }
   }
 
   /**
@@ -230,8 +197,7 @@ class QuotesModel {
     let txn
     let handledRuleEvents
     let fspiopSource
-    let childSpan
-
+    const handleQuoteRequestSpan = span.getChild('qs_quote_handleQuoteRequest')
     try {
       fspiopSource = headers[ENUM.Http.Headers.FSPIOP.SOURCE]
       const fspiopDestination = headers[ENUM.Http.Headers.FSPIOP.DESTINATION]
@@ -250,9 +216,6 @@ class QuotesModel {
       await this.validateQuoteRequest(fspiopSource, fspiopDestination, quoteRequest)
 
       if (!envConfig.simpleRoutingMode) {
-        // do everything in a db txn so we can rollback multiple operations if something goes wrong
-        txn = await this.db.newTransaction()
-
         // check if this is a resend or an erroneous duplicate
         const dupe = await this.checkDuplicateQuoteRequest(quoteRequest)
 
@@ -270,13 +233,16 @@ class QuotesModel {
           // this is a resend
           // See section 3.2.5.1 in "API Definition v1.0.docx" API specification document.
           return this.handleQuoteRequestResend(handledRuleEvents.headers,
-            handledRuleEvents.quoteRequest, span)
+            handledRuleEvents.quoteRequest, handleQuoteRequestSpan)
         }
+
+        // do everything in a db txn so we can rollback multiple operations if something goes wrong
+        txn = await this.db.newTransaction()
 
         // todo: validation
 
         // if we get here we need to create a duplicate check row
-        const hash = this.calculateRequestHash(quoteRequest)
+        const hash = calculateRequestHash(quoteRequest)
         await this.db.createQuoteDuplicateCheck(txn, quoteRequest.quoteId, hash)
 
         // create a txn reference
@@ -326,6 +292,13 @@ class QuotesModel {
         refs.payeeId = await this.db.createPayeeQuoteParty(txn, refs.quoteId, quoteRequest.payee,
           quoteRequest.amount.amount, quoteRequest.amount.currency)
 
+        // store any extension list items
+        if (quoteRequest.extensionList &&
+            Array.isArray(quoteRequest.extensionList.extension)) {
+          refs.extensions = await this.db.createQuoteExtensions(
+            txn, quoteRequest.extensionList.extension, quoteRequest.quoteId, quoteRequest.transactionId)
+        }
+
         // did we get a geoCode for the initiator?
         if (quoteRequest.geoCode) {
           // eslint-disable-next-line require-atomic-updates
@@ -341,45 +314,48 @@ class QuotesModel {
       }
 
       // if we got here rules passed, so we can forward the quote on to the recipient dfsp
-      childSpan = span.getChild('qs_quote_forwardQuoteRequest')
     } catch (err) {
       // internal-error
-      this.writeLog(`Error in handleQuoteRequest for quoteId ${quoteRequest.quoteId}: ${err.stack || util.inspect(err)}`)
+      this.writeLog(`Error in handleQuoteRequest for quoteId ${quoteRequest.quoteId}: ${getStackOrInspect(err)}`)
       if (txn) {
         txn.rollback(err)
       }
 
       const fspiopError = ErrorHandler.ReformatFSPIOPError(err)
       const state = new EventSdk.EventStateMetadata(EventSdk.EventStatusType.failed, fspiopError.apiErrorCode.code, fspiopError.apiErrorCode.message)
-      if (span) {
-        await span.error(fspiopError, state)
-        await span.finish(fspiopError.message, state)
+      await this.handleException(fspiopSource, quoteRequest.quoteId, fspiopError, headers, handleQuoteRequestSpan)
+      if (handleQuoteRequestSpan) {
+        await handleQuoteRequestSpan.error(fspiopError, state)
+        await handleQuoteRequestSpan.finish(fspiopError.message, state)
       }
-
       throw fspiopError
     }
-
+    let forwardQuoteRequestSpan
     try {
+      forwardQuoteRequestSpan = handleQuoteRequestSpan.getChild('qs_quote_forwardQuoteRequest')
       if (envConfig.simpleRoutingMode) {
-        await childSpan.audit({ headers, payload: quoteRequest }, EventSdk.AuditEventAction.start)
-        await this.forwardQuoteRequest(handledRuleEvents.headers, quoteRequest.quoteId, handledRuleEvents.quoteRequest, childSpan)
+        await forwardQuoteRequestSpan.audit({ headers, payload: quoteRequest }, EventSdk.AuditEventAction.start)
+        await this.forwardQuoteRequest(handledRuleEvents.headers, quoteRequest.quoteId, handledRuleEvents.quoteRequest, forwardQuoteRequestSpan)
       } else {
-        await childSpan.audit({ headers, payload: refs }, EventSdk.AuditEventAction.start)
-        await this.forwardQuoteRequest(handledRuleEvents.headers, refs.quoteId, handledRuleEvents.quoteRequest, childSpan)
+        await forwardQuoteRequestSpan.audit({ headers, payload: refs }, EventSdk.AuditEventAction.start)
+        await this.forwardQuoteRequest(handledRuleEvents.headers, refs.quoteId, handledRuleEvents.quoteRequest, forwardQuoteRequestSpan)
       }
     } catch (err) {
       // any-error
       // as we are on our own in this context, dont just rethrow the error, instead...
       // get the model to handle it
-      this.writeLog(`Error forwarding quote request: ${err.stack || util.inspect(err)}. Attempting to send error callback to ${fspiopSource}`)
+      this.writeLog(`Error forwarding quote request: ${getStackOrInspect(err)}. Attempting to send error callback to ${fspiopSource}`)
       if (envConfig.simpleRoutingMode) {
-        await this.handleException(fspiopSource, quoteRequest.quoteId, err, headers, childSpan)
+        await this.handleException(fspiopSource, quoteRequest.quoteId, err, headers, forwardQuoteRequestSpan)
       } else {
-        await this.handleException(fspiopSource, refs.quoteId, err, headers, childSpan)
+        await this.handleException(fspiopSource, refs.quoteId, err, headers, forwardQuoteRequestSpan)
       }
     } finally {
-      if (!childSpan.isFinished) {
-        await childSpan.finish()
+      if (!forwardQuoteRequestSpan.isFinished) {
+        await forwardQuoteRequestSpan.finish()
+      }
+      if (!handleQuoteRequestSpan.isFinished) {
+        await handleQuoteRequestSpan.finish()
       }
     }
 
@@ -423,7 +399,7 @@ class QuotesModel {
       }
 
       const fullCallbackUrl = `${endpoint}/quotes`
-      const newHeaders = this.generateRequestHeaders(headers)
+      const newHeaders = generateRequestHeaders(headers)
 
       this.writeLog(`Forwarding quote request to endpoint: ${fullCallbackUrl}`)
       this.writeLog(`Forwarding quote request headers: ${JSON.stringify(newHeaders)}`)
@@ -445,7 +421,7 @@ class QuotesModel {
       await httpRequest(opts, fspiopSource)
     } catch (err) {
       // any-error
-      this.writeLog(`Error forwarding quote request to endpoint ${endpoint}: ${err.stack || util.inspect(err)}`)
+      this.writeLog(`Error forwarding quote request to endpoint ${endpoint}: ${getStackOrInspect(err)}`)
       throw ErrorHandler.ReformatFSPIOPError(err)
     }
   }
@@ -472,7 +448,7 @@ class QuotesModel {
         // any-error
         // as we are on our own in this context, dont just rethrow the error, instead...
         // get the model to handle it
-        this.writeLog(`Error forwarding quote request: ${err.stack || util.inspect(err)}. Attempting to send error callback to ${fspiopSource}`)
+        this.writeLog(`Error forwarding quote request: ${getStackOrInspect(err)}. Attempting to send error callback to ${fspiopSource}`)
         const fspiopError = ErrorHandler.ReformatFSPIOPError(err)
         await this.handleException(fspiopSource, quoteRequest.quoteId, fspiopError, headers, childSpan)
       } finally {
@@ -482,7 +458,7 @@ class QuotesModel {
       }
     } catch (err) {
       // internal-error
-      this.writeLog(`Error in handleQuoteRequestResend: ${err.stack || util.inspect(err)}`)
+      this.writeLog(`Error in handleQuoteRequestResend: ${getStackOrInspect(err)}`)
       throw ErrorHandler.ReformatFSPIOPError(err)
     }
   }
@@ -496,6 +472,7 @@ class QuotesModel {
     let txn = null
     const fspiopSource = headers[ENUM.Http.Headers.FSPIOP.SOURCE]
     const envConfig = new Config()
+    const handleQuoteUpdateSpan = span.getChild('qs_quote_handleQuoteUpdate')
     try {
       // ensure no 'accept' header is present in the request headers.
       if ('accept' in headers) {
@@ -507,9 +484,6 @@ class QuotesModel {
       // accumulate enum ids
       const refs = {}
       if (!envConfig.simpleRoutingMode) {
-        // do everything in a transaction so we can rollback multiple operations if something goes wrong
-        txn = await this.db.newTransaction()
-
         // check if this is a resend or an erroneous duplicate
         const dupe = await this.checkDuplicateQuoteResponse(quoteId, quoteUpdateRequest)
         this.writeLog(`Check duplicate for quoteId ${quoteId} update returned: ${util.inspect(dupe)}`)
@@ -524,8 +498,11 @@ class QuotesModel {
         if (dupe.isResend && dupe.isDuplicateId) {
           // this is a resend
           // See section 3.2.5.1 in "API Definition v1.0.docx" API specification document.
-          return this.handleQuoteUpdateResend(headers, quoteId, quoteUpdateRequest, span)
+          return this.handleQuoteUpdateResend(headers, quoteId, quoteUpdateRequest, handleQuoteUpdateSpan)
         }
+
+        // do everything in a transaction so we can rollback multiple operations if something goes wrong
+        txn = await this.db.newTransaction()
 
         // todo: validation
 
@@ -543,7 +520,7 @@ class QuotesModel {
         refs.quoteResponseId = newQuoteResponse.quoteResponseId
 
         // if we get here we need to create a duplicate check row
-        const hash = this.calculateRequestHash(quoteUpdateRequest)
+        const hash = calculateRequestHash(quoteUpdateRequest)
         await this.db.createQuoteUpdateDuplicateCheck(txn, quoteId, refs.quoteResponseId, hash)
 
         // create ilp packet in the db
@@ -566,6 +543,13 @@ class QuotesModel {
           })
         }
 
+        // store any extension list items
+        if (quoteUpdateRequest.extensionList &&
+            Array.isArray(quoteUpdateRequest.extensionList.extension)) {
+          refs.extensions = await this.db.createQuoteExtensions(
+            txn, quoteUpdateRequest.extensionList.extension, quoteId, null, refs.quoteResponseId)
+        }
+
         // todo: create any additional quoteParties e.g. for fees, comission etc...
 
         await txn.commit()
@@ -584,7 +568,7 @@ class QuotesModel {
         // }
       }
       // if we got here rules passed, so we can forward the quote on to the recipient dfsp
-      const childSpan = span.getChild('qs_quote_forwardQuoteUpdate')
+      const childSpan = handleQuoteUpdateSpan.getChild('qs_quote_forwardQuoteUpdate')
       try {
         await childSpan.audit({ headers, params: { quoteId }, payload: quoteUpdateRequest }, EventSdk.AuditEventAction.start)
         await this.forwardQuoteUpdate(headers, quoteId, quoteUpdateRequest, childSpan)
@@ -593,11 +577,14 @@ class QuotesModel {
         // as we are on our own in this context, dont just rethrow the error, instead...
         // get the model to handle it
         const fspiopSource = headers[ENUM.Http.Headers.FSPIOP.SOURCE]
-        this.writeLog(`Error forwarding quote update: ${err.stack || util.inspect(err)}. Attempting to send error callback to ${fspiopSource}`)
+        this.writeLog(`Error forwarding quote update: ${getStackOrInspect(err)}. Attempting to send error callback to ${fspiopSource}`)
         await this.handleException(fspiopSource, quoteId, err, headers, childSpan)
       } finally {
         if (!childSpan.isFinished) {
           await childSpan.finish()
+        }
+        if (!handleQuoteUpdateSpan.isFinished) {
+          await handleQuoteUpdateSpan.finish()
         }
       }
 
@@ -605,15 +592,16 @@ class QuotesModel {
       return refs
     } catch (err) {
       // internal-error
-      this.writeLog(`Error in handleQuoteUpdate: ${err.stack || util.inspect(err)}`)
+      this.writeLog(`Error in handleQuoteUpdate: ${getStackOrInspect(err)}`)
       if (txn) {
         txn.rollback(err)
       }
       const fspiopError = ErrorHandler.ReformatFSPIOPError(err)
       const state = new EventSdk.EventStateMetadata(EventSdk.EventStatusType.failed, fspiopError.apiErrorCode.code, fspiopError.apiErrorCode.message)
-      if (span) {
-        await span.error(fspiopError, state)
-        await span.finish(fspiopError.message, state)
+      await this.handleException(fspiopSource, quoteId, err, headers, handleQuoteUpdateSpan)
+      if (handleQuoteUpdateSpan) {
+        await handleQuoteUpdateSpan.error(fspiopError, state)
+        await handleQuoteUpdateSpan.finish(fspiopError.message, state)
       }
       throw fspiopError
     }
@@ -651,14 +639,14 @@ class QuotesModel {
         // we didnt get an endpoint for the payee dfsp!
         // make an error callback to the initiator
         const fspiopError = ErrorHandler.CreateFSPIOPError(ErrorHandler.Enums.FSPIOPErrorCodes.DESTINATION_FSP_ERROR, `No FSPIOP_CALLBACK_URL_QUOTES found for quote ${quoteId} PAYER party`, null, fspiopSource)
-        return this.sendErrorCallback(fspiopSource, fspiopError, quoteId, headers)
+        return this.sendErrorCallback(fspiopSource, fspiopError, quoteId, headers, true)
       }
 
       const fullCallbackUrl = `${endpoint}/quotes/${quoteId}`
       // we need to strip off the 'accept' header
       // for all PUT requests as per the API Specification Document
       // https://github.com/mojaloop/mojaloop-specification/blob/master/API%20Definition%20v1.0.pdf
-      const newHeaders = this.generateRequestHeaders(headers)
+      const newHeaders = generateRequestHeaders(headers, true)
 
       this.writeLog(`Forwarding quote response to endpoint: ${fullCallbackUrl}`)
       this.writeLog(`Forwarding quote response headers: ${JSON.stringify(newHeaders)}`)
@@ -679,7 +667,7 @@ class QuotesModel {
       await httpRequest(opts, fspiopSource)
     } catch (err) {
       // any-error
-      this.writeLog(`Error forwarding quote response to endpoint ${endpoint}: ${err.stack || util.inspect(err)}`)
+      this.writeLog(`Error forwarding quote response to endpoint ${endpoint}: ${getStackOrInspect(err)}`)
       throw ErrorHandler.ReformatFSPIOPError(err)
     }
   }
@@ -707,7 +695,7 @@ class QuotesModel {
         // any-error
         // as we are on our own in this context, dont just rethrow the error, instead...
         // get the model to handle it
-        this.writeLog(`Error forwarding quote response: ${err.stack || util.inspect(err)}. Attempting to send error callback to ${fspiopSource}`)
+        this.writeLog(`Error forwarding quote response: ${getStackOrInspect(err)}. Attempting to send error callback to ${fspiopSource}`)
         await this.handleException(fspiopSource, quoteId, err, headers, childSpan)
       } finally {
         if (!childSpan.isFinished) {
@@ -716,7 +704,7 @@ class QuotesModel {
       }
     } catch (err) {
       // internal-error
-      this.writeLog(`Error in handleQuoteUpdateResend: ${err.stack || util.inspect(err)}`)
+      this.writeLog(`Error in handleQuoteUpdateResend: ${getStackOrInspect(err)}`)
       throw ErrorHandler.ReformatFSPIOPError(err)
     }
   }
@@ -730,6 +718,7 @@ class QuotesModel {
     let txn = null
     const envConfig = new Config()
     let newError
+    const childSpan = span.getChild('qs_quote_handleQuoteError')
     try {
       if (!envConfig.simpleRoutingMode) {
         // do everything in a transaction so we can rollback multiple operations if something goes wrong
@@ -748,18 +737,21 @@ class QuotesModel {
       // create a new object to represent the error
       const fspiopError = ErrorHandler.CreateFSPIOPErrorFromErrorInformation(error)
 
-      this.sendErrorCallback(headers[ENUM.Http.Headers.FSPIOP.SOURCE], fspiopError, quoteId, headers, span)
+      // Needed to add await here to prevent 'childSpan already finished' bug
+      await this.sendErrorCallback(headers[ENUM.Http.Headers.FSPIOP.DESTINATION], fspiopError, quoteId, headers, childSpan, false)
 
       return newError
     } catch (err) {
       // internal-error
-      this.writeLog(`Error in handleQuoteError: ${err.stack || util.inspect(err)}`)
-      txn.rollback(err)
+      this.writeLog(`Error in handleQuoteError: ${getStackOrInspect(err)}`)
+      if (txn) {
+        txn.rollback(err)
+      }
       const fspiopError = ErrorHandler.ReformatFSPIOPError(err)
       const state = new EventSdk.EventStateMetadata(EventSdk.EventStatusType.failed, fspiopError.apiErrorCode.code, fspiopError.apiErrorCode.message)
-      if (span) {
-        await span.error(fspiopError, state)
-        await span.finish(fspiopError.message, state)
+      if (childSpan) {
+        await childSpan.error(fspiopError, state)
+        await childSpan.finish(fspiopError.message, state)
       }
       throw fspiopError
     }
@@ -772,8 +764,9 @@ class QuotesModel {
    */
   async handleQuoteGet (headers, quoteId, span) {
     const fspiopSource = headers[ENUM.Http.Headers.FSPIOP.SOURCE]
+    let childSpan
     try {
-      const childSpan = span.getChild('qs_quote_forwardQuoteGet')
+      childSpan = span.getChild('qs_quote_forwardQuoteGet')
       try {
         await childSpan.audit({ headers, params: { quoteId } }, EventSdk.AuditEventAction.start)
         await this.forwardQuoteGet(headers, quoteId, childSpan)
@@ -781,7 +774,7 @@ class QuotesModel {
         // any-error
         // as we are on our own in this context, dont just rethrow the error, instead...
         // get the model to handle it
-        this.writeLog(`Error forwarding quote get: ${err.stack || util.inspect(err)}. Attempting to send error callback to ${fspiopSource}`)
+        this.writeLog(`Error forwarding quote get: ${getStackOrInspect(err)}. Attempting to send error callback to ${fspiopSource}`)
         await this.handleException(fspiopSource, quoteId, err, headers, childSpan)
       } finally {
         if (!childSpan.isFinished) {
@@ -790,14 +783,8 @@ class QuotesModel {
       }
     } catch (err) {
       // internal-error
-      this.writeLog(`Error in handleQuoteGet: ${err.stack || util.inspect(err)}`)
-      const fspiopError = ErrorHandler.ReformatFSPIOPError(err)
-      const state = new EventSdk.EventStateMetadata(EventSdk.EventStatusType.failed, fspiopError.apiErrorCode.code, fspiopError.apiErrorCode.message)
-      if (span) {
-        await span.error(fspiopError, state)
-        await span.finish(fspiopError.message, state)
-      }
-      throw fspiopError
+      this.writeLog(`Error in handleQuoteGet: ${getStackOrInspect(err)}`)
+      throw ErrorHandler.ReformatFSPIOPError(err)
     }
   }
 
@@ -829,7 +816,7 @@ class QuotesModel {
       }
 
       const fullCallbackUrl = `${endpoint}/quotes/${quoteId}`
-      const newHeaders = this.generateRequestHeaders(headers)
+      const newHeaders = generateRequestHeaders(headers)
 
       this.writeLog(`Forwarding quote get request to endpoint: ${fullCallbackUrl}`)
 
@@ -847,7 +834,7 @@ class QuotesModel {
       await httpRequest(opts, fspiopSource)
     } catch (err) {
       // any-error
-      this.writeLog(`Error forwarding quote get request: ${err.stack || util.inspect(err)}`)
+      this.writeLog(`Error forwarding quote get request: ${getStackOrInspect(err)}`)
       throw ErrorHandler.ReformatFSPIOPError(err)
     }
   }
@@ -863,11 +850,11 @@ class QuotesModel {
     const childSpan = span.getChild('qs_quote_sendErrorCallback')
     try {
       await childSpan.audit({ headers, params: { quoteId } }, EventSdk.AuditEventAction.start)
-      return await this.sendErrorCallback(fspiopSource, fspiopError, quoteId, headers, childSpan)
+      return await this.sendErrorCallback(fspiopSource, fspiopError, quoteId, headers, childSpan, true)
     } catch (err) {
       // any-error
       // not much we can do other than log the error
-      this.writeLog(`Error occurred while handling error. Check service logs as this error may not have been propagated successfully to any other party: ${err.stack || util.inspect(err)}`)
+      this.writeLog(`Error occurred while handling error. Check service logs as this error may not have been propagated successfully to any other party: ${getStackOrInspect(err)}`)
     } finally {
       if (!childSpan.isFinished) {
         await childSpan.finish()
@@ -882,7 +869,7 @@ class QuotesModel {
    *
    * @returns {promise}
    */
-  async sendErrorCallback (fspiopSource, fspiopError, quoteId, headers, span) {
+  async sendErrorCallback (fspiopSource, fspiopError, quoteId, headers, span, modifyHeaders = true) {
     const envConfig = new Config()
     const fspiopDest = headers[ENUM.Http.Headers.FSPIOP.DESTINATION]
     try {
@@ -904,19 +891,40 @@ class QuotesModel {
       this.writeLog(`Making error callback to participant '${fspiopSource}' for quoteId '${quoteId}' to ${fullCallbackUrl} for error: ${util.inspect(fspiopError.toFullErrorObject())}`)
 
       // make an error callback
-      const fromSwitchHeaders = Object.assign({}, headers, {
-        'fspiop-destination': fspiopSource,
-        'fspiop-source': ENUM.Http.Headers.FSPIOP.SWITCH.value,
-        'fspiop-http-method': ENUM.Http.RestMethods.PUT,
-        'fspiop-uri': fspiopUri
-      })
+      let fromSwitchHeaders
+      let formattedHeaders
+
+      // modify/set the headers only in case it is explicitly requested to do so
+      // as this part needs to cover two different cases:
+      // 1. (do not modify them) when the Switch needs to relay an error, e.g. from a DFSP to another
+      // 2. (modify/set them) when the Switch needs send errors that are originating in the Switch, e.g. to send an error back to the caller
+      if (modifyHeaders === true) {
+        // Should not forward 'fspiop-signature' header for switch generated messages
+        delete headers['fspiop-signature']
+        fromSwitchHeaders = Object.assign({}, headers, {
+          'fspiop-destination': fspiopSource,
+          'fspiop-source': ENUM.Http.Headers.FSPIOP.SWITCH.value,
+          'fspiop-http-method': ENUM.Http.RestMethods.PUT,
+          'fspiop-uri': fspiopUri
+        })
+      } else {
+        fromSwitchHeaders = Object.assign({}, headers)
+      }
+
+      // JWS Signer expects headers in lowercase
+      if (envConfig.jws && envConfig.jws.jwsSign && fromSwitchHeaders['fspiop-source'] === envConfig.jws.fspiopSourceToSign) {
+        formattedHeaders = generateRequestHeadersForJWS(fromSwitchHeaders, true)
+      } else {
+        formattedHeaders = generateRequestHeaders(fromSwitchHeaders, true)
+      }
+
       let opts = {
         method: ENUM.Http.RestMethods.PUT,
         url: fullCallbackUrl,
         data: JSON.stringify(fspiopError.toApiErrorObject(envConfig.errorHandling), LibUtil.getCircularReplacer()),
         // use headers of the error object if they are there...
         // otherwise use sensible defaults
-        headers: this.generateRequestHeaders(fromSwitchHeaders, true)
+        headers: formattedHeaders
       }
 
       if (span) {
@@ -926,6 +934,19 @@ class QuotesModel {
 
       let res
       try {
+        // If JWS is enabled and the 'fspiop-source' matches the configured jws header value('switch')
+        // that means it's a switch generated message and we need to sign it
+        if (envConfig.jws && envConfig.jws.jwsSign && opts.headers['fspiop-source'] === envConfig.jws.fspiopSourceToSign) {
+          const logger = Logger
+          logger.log = logger.info
+          this.writeLog('Getting the JWS Signer to sign the switch generated message')
+          const jwsSigner = new JwsSigner({
+            logger,
+            signingKey: envConfig.jws.jwsSigningKey
+          })
+          opts.headers['fspiop-signature'] = jwsSigner.getSignature(opts)
+        }
+
         res = await axios.request(opts)
       } catch (err) {
         // external-error
@@ -953,7 +974,7 @@ class QuotesModel {
       }
     } catch (err) {
       // any-error
-      this.writeLog(`Error in sendErrorCallback: ${err.stack || util.inspect(err)}`)
+      this.writeLog(`Error in sendErrorCallback: ${getStackOrInspect(err)}`)
       const fspiopError = ErrorHandler.ReformatFSPIOPError(err)
       const state = new EventSdk.EventStateMetadata(EventSdk.EventStatusType.failed, fspiopError.apiErrorCode.code, fspiopError.apiErrorCode.message)
       if (span) {
@@ -974,7 +995,7 @@ class QuotesModel {
   async checkDuplicateQuoteRequest (quoteRequest) {
     try {
       // calculate a SHA-256 of the request
-      const hash = this.calculateRequestHash(quoteRequest)
+      const hash = calculateRequestHash(quoteRequest)
       this.writeLog(`Calculated sha256 hash of quote request with id ${quoteRequest.quoteId} as: ${hash}`)
 
       const dupchk = await this.db.getQuoteDuplicateCheck(quoteRequest.quoteId)
@@ -1003,7 +1024,7 @@ class QuotesModel {
       }
     } catch (err) {
       // internal-error
-      this.writeLog(`Error in checkDuplicateQuoteRequest: ${err.stack || util.inspect(err)}`)
+      this.writeLog(`Error in checkDuplicateQuoteRequest: ${getStackOrInspect(err)}`)
       throw ErrorHandler.ReformatFSPIOPError(err)
     }
   }
@@ -1018,7 +1039,7 @@ class QuotesModel {
   async checkDuplicateQuoteResponse (quoteId, quoteResponse) {
     try {
       // calculate a SHA-256 of the request
-      const hash = this.calculateRequestHash(quoteResponse)
+      const hash = calculateRequestHash(quoteResponse)
       this.writeLog(`Calculated sha256 hash of quote response with id ${quoteId} as: ${hash}`)
 
       const dupchk = await this.db.getQuoteResponseDuplicateCheck(quoteId)
@@ -1047,71 +1068,9 @@ class QuotesModel {
       }
     } catch (err) {
       // internal-error
-      this.writeLog(`Error in checkDuplicateQuoteResponse: ${err.stack || util.inspect(err)}`)
+      this.writeLog(`Error in checkDuplicateQuoteResponse: ${getStackOrInspect(err)}`)
       throw ErrorHandler.ReformatFSPIOPError(err)
     }
-  }
-
-  /**
-   * Utility function to remove null and undefined keys from an object.
-   * This is useful for removing "nulls" that come back from database queries
-   * when projecting into API spec objects
-   *
-   * @returns {object}
-   */
-  removeEmptyKeys (originalObject) {
-    const obj = { ...originalObject }
-    Object.keys(obj).forEach(key => {
-      if (obj[key] && typeof obj[key] === 'object') {
-        if (Object.keys(obj[key]).length < 1) {
-          // remove empty object
-          delete obj[key]
-        } else {
-          // recurse
-          obj[key] = this.removeEmptyKeys(obj[key])
-        }
-      } else if (obj[key] == null) {
-        // null or undefined, remove it
-        delete obj[key]
-      }
-    })
-    return obj
-  }
-
-  /**
-   * Returns the SHA-256 hash of the supplied request object
-   *
-   * @returns {undefined}
-   */
-  calculateRequestHash (request) {
-    // calculate a SHA-256 of the request
-    const requestStr = JSON.stringify(request)
-    return crypto.createHash('sha256').update(requestStr).digest('hex')
-  }
-
-  /**
-   * Generates and returns an object containing API spec compliant HTTP request headers
-   *
-   * @returns {object}
-   */
-  generateRequestHeaders (headers, noAccept) {
-    const ret = {
-      'Content-Type': 'application/vnd.interoperability.quotes+json;version=1.0',
-      Date: headers.date,
-      'FSPIOP-Source': headers['fspiop-source'],
-      'FSPIOP-Destination': headers['fspiop-destination'],
-      'FSPIOP-HTTP-Method': headers['fspiop-http-method'],
-      'FSPIOP-Signature': headers['fspiop-signature'],
-      'FSPIOP-URI': headers['fspiop-uri'],
-      'User-Agent': null, // yuck! node-fetch INSISTS on sending a user-agent header!? infuriating!
-      Accept: null
-    }
-
-    if (!noAccept) {
-      ret.Accept = 'application/vnd.interoperability.quotes+json;version=1'
-    }
-
-    return this.removeEmptyKeys(ret)
   }
 
   /**
