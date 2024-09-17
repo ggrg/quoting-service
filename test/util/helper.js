@@ -23,6 +23,39 @@
  ******/
 'use strict'
 
+const SwagMock = require('swagmock')
+const Path = require('path')
+const apiPath = Path.resolve(__dirname, '../../src/interface/swagger.json')
+let mockGen
+
+/**
+ * @object baseMockRequest
+ *
+ * @description A basic mock request object for passing into handlers
+ *
+ */
+const baseMockRequest = {
+  headers: {
+    'fspiop-source': 'payerfsp'
+  },
+  info: {
+    id: '12345'
+  },
+  params: {
+    id: 'quoteId12345'
+  },
+  server: {
+    app: {
+      database: jest.fn()
+    },
+    log: jest.fn()
+  },
+  span: {
+    setTags: jest.fn(),
+    audit: jest.fn()
+  }
+}
+
 /**
  * @function defaultHeaders
  *
@@ -36,7 +69,7 @@ function defaultHeaders () {
   const destination = 'payeefsp'
   const source = 'payerfsp'
   const resource = 'quotes'
-  const version = '1.0'
+  const version = '1.1'
   // TODO: See API section 3.2.1; what should we do about X-Forwarded-For? Also, should we
   // add/append to this field in all 'queueResponse' calls?
   return {
@@ -48,6 +81,33 @@ function defaultHeaders () {
   }
 }
 
+/**
+ * Global MockGenerator Singleron
+ */
+const mockRequest = () => {
+  if (mockGen) {
+    return mockGen
+  }
+
+  mockGen = SwagMock(apiPath)
+
+  /**
+   * Add an async version of requests
+   */
+  mockGen.requestsAsync = async (path, operation) => {
+    return new Promise((resolve, reject) => {
+      mockGen.requests(
+        { path, operation },
+        (error, mock) => error ? reject(error) : resolve(mock)
+      )
+    })
+  }
+
+  return mockGen
+}
+
 module.exports = {
-  defaultHeaders
+  baseMockRequest,
+  defaultHeaders,
+  mockRequest
 }

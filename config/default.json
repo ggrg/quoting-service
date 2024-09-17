@@ -6,6 +6,23 @@
     "PRECISION": 18,
     "SCALE": 4
   },
+  "PROTOCOL_VERSIONS": {
+    "CONTENT": {
+      "DEFAULT": "1.1",
+      "VALIDATELIST": [
+        "1.1",
+        "1.0"
+      ]
+    },
+    "ACCEPT": {
+      "DEFAULT": "1",
+      "VALIDATELIST": [
+        "1",
+        "1.0",
+        "1.1"
+      ]
+    }
+  },
   "DATABASE": {
     "DIALECT": "mysql",
     "HOST": "localhost",
@@ -28,5 +45,13 @@
     "includeCauseExtension": false,
     "truncateExtensions": true
   },
-  "SIMPLE_ROUTING_MODE": true
+  "SIMPLE_ROUTING_MODE": true,
+  "ENDPOINT_SECURITY":{
+    "JWS": {
+      "JWS_SIGN": false,
+      "FSPIOP_SOURCE_TO_SIGN": "switch",
+      "JWS_SIGNING_KEY_PATH": "secrets/jwsSigningKey.key"
+    }
+  },
+  "API_DOCUMENTATION_ENDPOINTS": true
 }
